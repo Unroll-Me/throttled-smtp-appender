@@ -16,6 +16,7 @@
 
         <!-- How to connect to your mail server -->
         <SMTPHost>localhost</SMTPHost>
+	<SMTPPort>4929</SMTPPort>
         <Username>test</Username>
         <Password>test</Password>
         <To>developers.app.xyz@test.no</To>

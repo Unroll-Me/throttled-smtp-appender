@@ -93,7 +93,7 @@ public class ThrottledSMTPAppenderTest extends TestCase
     protected void setUp() throws Exception
     {
         super.setUp();
-        smtpServer = SimpleSmtpServer.start();
+        smtpServer = SimpleSmtpServer.start(4929); /* random */
     }
     
     @Override
