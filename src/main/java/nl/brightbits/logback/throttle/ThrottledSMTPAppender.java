@@ -131,7 +131,7 @@ public class ThrottledSMTPAppender extends SMTPAppender {
 	private int maxMessagesPerTimeWindow = 10;
 	private Level logMuzzledMessagesOnLevel = Level.ERROR;
 	private String replenisherThreadName = "ThrottledSMTPAppender-Replenisher";
-	
+
 	@Override
 	public void start() {
 		super.start();
@@ -141,7 +141,7 @@ public class ThrottledSMTPAppender extends SMTPAppender {
 			@Override
 			public Thread newThread(Runnable task) {
 
-				Thread thread = new Thread(replenisherThreadName);
+				Thread thread = new Thread(task, replenisherThreadName);
 				thread.setDaemon(true);
 				return thread;
 			}
@@ -263,6 +263,10 @@ public class ThrottledSMTPAppender extends SMTPAppender {
 			LocationData data = entry.getValue();
 
 			int nrMuzzled = data.messagesMuzzled.getAndSet(0);
+			
+			if(nrMuzzled == 0) {
+				continue;
+			}
 
 			final String message = "Muzzled " + nrMuzzled + " message" + (nrMuzzled > 1 ? "s" : "") + " from "
 					+ location;
