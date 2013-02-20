@@ -1,8 +1,16 @@
 package nl.brightbits.logback.throttle;
 
-import java.util.HashMap;
+import java.util.Iterator;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -13,17 +21,26 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 
 /**
  * Can be used to prevent against flooding a mail server with log messages. <br>
- * Basically the source location of a message is tracked. 
- * When X messages have been logged from a location within Y seconds (configurable) other messages from that location will be muzzled during the remaining time of that period (Y).<br><br>
+ * Basically the source location of a message is tracked. When X messages have
+ * been logged from a location within Y seconds (configurable) other messages
+ * from that location will be muzzled during the remaining time of that period
+ * (Y).<br>
+ * <br>
  * 
  * <b>Scenario</b> <br>
- * You configure Logback to send error messages via mail so you are immediately informed when an error occurs. <br>
- * During development this works fine. But in production the load on your application is much higher (hopefully :-)). <br>
- * So when an unexpected problem occurs, lets say it generates an error for every page view, a lot of error messages will be send. <br>
- * This will put stress on your mail server while you probably only need a couple of messages to be aware of the problem. <br><br>
+ * You configure Logback to send error messages via mail so you are immediately
+ * informed when an error occurs. <br>
+ * During development this works fine. But in production the load on your
+ * application is much higher (hopefully :-)). <br>
+ * So when an unexpected problem occurs, lets say it generates an error for
+ * every page view, a lot of error messages will be send. <br>
+ * This will put stress on your mail server while you probably only need a
+ * couple of messages to be aware of the problem. <br>
+ * <br>
  * 
  * <b>Usage</b> <br>
- * Configure this appender in your logback.xml file: <br><br>
+ * Configure this appender in your logback.xml file: <br>
+ * <br>
  * <code>
  * &lt;?xml&nbsp;version=&quot;1.0&quot;&nbsp;encoding=&quot;UTF-8&quot;?&gt;
  * <br>&lt;configuration&nbsp;debug=&quot;false&quot;&gt;
@@ -75,202 +92,210 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
  * <br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&lt;appender-ref&nbsp;ref=&quot;EMAIL&quot;&nbsp;/&gt;
  * <br>&nbsp;&nbsp;&nbsp;&nbsp;&lt;/root&gt;
  * <br>&lt;/configuration&gt;
- * </code> <br><br>
+ * </code> <br>
+ * <br>
  * 
  * <b>Example</b> <br>
  * Messages allowed to be mailed will not be touched and mailed like normal. <br>
- * Muzzled messages will be logged like: 
- * <code>
+ * Muzzled messages will be logged like: <code>
  * Muzzled 10 messages from nl.brightbits.logback.throttle.ThrottledSMTPAppenderTest.testThrottling(ThrottledSMTPAppenderTest.java:43) 
  * </code>
  * 
  * @author Ricardo Lindooren
- *
+ * 
  */
-public class ThrottledSMTPAppender extends SMTPAppender
-{
-    Map<String, Semaphore> nrOfMessagesLeftPerLocation = new HashMap<String, Semaphore>();
-    Map<String, Integer> nrOfMessagesMuzzledPerLocation = new HashMap<String, Integer>();
-    
-    private long timeWindowDurationSeconds = 60;
-    private int maxMessagesPerTimeWindow = 10;
-    private Level logMuzzledMessagesOnLevel = Level.ERROR;
-    
-    @Override
-    public void start()
-    {
-        super.start();
-        
-        ReplenishMessageTokensThread t = new ReplenishMessageTokensThread();
-        t.setName("ThrottledSMTPAppender-Replenisher");
-        t.start();
-    }
-    
-    @Override
-    protected void append(ILoggingEvent eventObject)
-    {
-        final String locationKey = getCallerLocation(eventObject);
-        
-        Semaphore s = getTokensForLocation(locationKey);
+public class ThrottledSMTPAppender extends SMTPAppender {
 
-        // Test if there are tokens left
-        if (s.tryAcquire())
-        {
-            // Log the message like normal
-            super.append(eventObject);
-        }
-        else
-        {
-            // For the current time window the max number of messages have been logged
-            // Muzzle output until message tokens have been replenished after the current time window
-            muzzle(locationKey);
-        }
-    }
-    
-    private void muzzle(final String locationKey)
-    {
-        Integer muzzled = nrOfMessagesMuzzledPerLocation.get(locationKey);
-        if (muzzled == null)
-        {
-            muzzled = 1;
-        }
-        else
-        {
-            muzzled = muzzled + 1;
-        }
-        nrOfMessagesMuzzledPerLocation.put(locationKey, muzzled);
-    }
+	private static class LocationData {
+		public final Semaphore semaphore;
+		public final AtomicInteger messagesMuzzled;
 
-    private Semaphore getTokensForLocation(final String locationKey)
-    {
-        Semaphore s = nrOfMessagesLeftPerLocation.get(locationKey);
-        if (s == null)
-        {
-            s = new Semaphore(maxMessagesPerTimeWindow);
-            nrOfMessagesLeftPerLocation.put(locationKey, s);
-        }
-        return s;
-    }
+		public LocationData(int semaphoreCount, int initialMessagesMuzzled) {
+			semaphore = new Semaphore(semaphoreCount);
+			messagesMuzzled = new AtomicInteger(initialMessagesMuzzled);
+		}
+	}
 
-    /**
-     * class . method ( file : linenr )
-     * 
-     * @param event
-     * 
-     * @return e.g.: <code>nl.brightbits.logback.throttle.ThrottledSMTPAppenderTest.testThrottling(ThrottledSMTPAppenderTest.java:38)</code>
-     */
-    private String getCallerLocation(ILoggingEvent event)
-    {
-        StackTraceElement[] cda = event.getCallerData();
-        
-        if (cda != null && cda.length > 0)
-        {
-            StackTraceElement ste = cda[0];
-            return  ste.getClassName() + "." + ste.getMethodName() + "(" + ste.getFileName() + ":" + ste.getLineNumber() + ")";
-        }
-        
-        return "?";
-    }
-    
-    public void setLogMuzzledMessagesOnLevel(String level)
-    {
-        this.logMuzzledMessagesOnLevel = Level.toLevel(level);
-    }
-    
-    public void setTimeWindowDurationSeconds(long timeWindowDurationSeconds)
-    {
-        this.timeWindowDurationSeconds = timeWindowDurationSeconds;
-    }
+	/*
+	 * the write lock is used for removing entries, and the read lock is used
+	 * for inserting and updating entries. A lock-free threadsafe pattern is
+	 * used to insert. Essentially, mutating the value including inserting a new
+	 * one counts as a "read" and changing the value counts as a "write"
+	 */
 
-    public void setMaxMessagesPerTimeWindow(int maxMessagesPerTimeWindow)
-    {
-        this.maxMessagesPerTimeWindow = maxMessagesPerTimeWindow;
-    }
-    
-    /**
-     * Replenishes the log message tokens at the end of a time window. <br>
-     * At the end of a time window the number of muzzled messages are logged as well.
-     */
-    private class ReplenishMessageTokensThread extends Thread
-    {
-        //final static Logger logger = LoggerFactory.getLogger(ThrottledSMTPAppender.class);
-        
-        @Override
-        public void run()
-        {
-            while (true)
-            {
-                try
-                {
-                    Thread.sleep(timeWindowDurationSeconds * 1000);
-                }
-                catch (InterruptedException ex)
-                {
-                    System.err.println("Sleep unexpectedly interrupted");
-                    ex.printStackTrace();
-                }
-                
-                replenishTokens();
-                
-                logMuzzledMessages();
-            }
-        }
+	ReadWriteLock locationDataLock = new ReentrantReadWriteLock();
 
-        private void replenishTokens()
-        {
-            for (String location : nrOfMessagesLeftPerLocation.keySet())
-            {
-                Semaphore s = nrOfMessagesLeftPerLocation.get(location);
-                int usedPermits = maxMessagesPerTimeWindow - s.availablePermits();
-                s.release(usedPermits);
-            }
-        }
+	ConcurrentMap<String, LocationData> locationData = new ConcurrentHashMap<>();
 
-        /**
-         * Logs a message for every location that has muzzled messages.
-         */
-        private void logMuzzledMessages()
-        {
-            for (String location : nrOfMessagesMuzzledPerLocation.keySet())
-            {
-                Integer nrOfMessagesMuzzled = nrOfMessagesMuzzledPerLocation.get(location);
-                if (nrOfMessagesMuzzled != null)
-                {
-                    final String message = "Muzzled " + nrOfMessagesMuzzled + " message" + (nrOfMessagesMuzzled > 1 ? "s" : "") + " from " + location;
-                    
-                    // Log how many messages have been muzzled for the current location
-                    switch(logMuzzledMessagesOnLevel.levelInt)
-                    {
-                        case Level.TRACE_INT:
-                            Log.logger.trace(message);
-                            break;
-                        case Level.DEBUG_INT:
-                            Log.logger.debug(message);
-                            break;
-                        case Level.INFO_INT:
-                            Log.logger.info(message);
-                            break;
-                        case Level.WARN_INT:
-                            Log.logger.warn(message);
-                            break;
-                        case Level.ERROR_INT:
-                            Log.logger.error(message);
-                            break;
-                        default:
-                            // Nothing
-                    }
-                }
-            }
-            
-            nrOfMessagesMuzzledPerLocation.clear();
-        }
-    }
-    
-    /**
-     * Used to instantiate a logger outside the Logback configuration process
-     */
-    private static class Log
-    {
-        final static Logger logger = LoggerFactory.getLogger(Log.class);
-    }
+	private long timeWindowDurationSeconds = 60;
+	private int maxMessagesPerTimeWindow = 10;
+	private Level logMuzzledMessagesOnLevel = Level.ERROR;
+	private String replenisherThreadName = "ThrottledSMTPAppender-Replenisher";
+	
+	@Override
+	public void start() {
+		super.start();
+
+		ScheduledThreadPoolExecutor pool = new ScheduledThreadPoolExecutor(1, new ThreadFactory() {
+
+			@Override
+			public Thread newThread(Runnable task) {
+
+				Thread thread = new Thread(replenisherThreadName);
+				thread.setDaemon(true);
+				return thread;
+			}
+		});
+
+		pool.scheduleAtFixedRate(new Runnable() {
+			@Override
+			public void run() {
+
+				synchronized (locationDataLock.writeLock()) {
+					replenishTokens();
+					logMuzzledMessages();
+					locationData.clear();
+				}
+			}
+		}, timeWindowDurationSeconds, timeWindowDurationSeconds, TimeUnit.SECONDS);
+	}
+
+	@Override
+	protected void append(ILoggingEvent eventObject) {
+		final String locationKey = getCallerLocation(eventObject);
+
+		synchronized (locationDataLock.readLock()) {
+
+			// standard ConcurrentMap pattern to avoid extra object creation
+			// yes, this is happening inside a synchronization block because
+			// this pattern permits two reads to happen concurrently, as reads
+			// are responsible for insertions
+
+			LocationData data = locationData.get(locationKey);
+
+			// It is enforced by read-write lock the value of
+			// locationData.get(locationKey) will not change after this "if"
+			// block
+
+			if (data == null) {
+				locationData.putIfAbsent(locationKey, new LocationData(maxMessagesPerTimeWindow, 0));
+				data = locationData.get(locationKey);
+			}
+
+			if (data.semaphore.tryAcquire()) {
+				super.append(eventObject);
+			}
+			else {
+				data.messagesMuzzled.incrementAndGet();
+			}
+		}
+	}
+
+	/**
+	 * class . method ( file : linenr )
+	 * 
+	 * @param event
+	 * 
+	 * @return e.g.:
+	 *         <code>nl.brightbits.logback.throttle.ThrottledSMTPAppenderTest.testThrottling(ThrottledSMTPAppenderTest.java:38)</code>
+	 */
+	private String getCallerLocation(ILoggingEvent event) {
+		StackTraceElement[] cda = event.getCallerData();
+
+		if (cda != null && cda.length > 0) {
+			StackTraceElement ste = cda[0];
+			return ste.getClassName() + "." + ste.getMethodName() + "(" + ste.getFileName() + ":" + ste.getLineNumber()
+					+ ")";
+		}
+
+		return "?";
+	}
+
+	public void setLogMuzzledMessagesOnLevel(String level) {
+		this.logMuzzledMessagesOnLevel = Level.toLevel(level);
+	}
+
+	public void setTimeWindowDurationSeconds(long timeWindowDurationSeconds) {
+		this.timeWindowDurationSeconds = timeWindowDurationSeconds;
+	}
+
+	public void setMaxMessagesPerTimeWindow(int maxMessagesPerTimeWindow) {
+		this.maxMessagesPerTimeWindow = maxMessagesPerTimeWindow;
+	}
+
+	/**
+	 * This method is necessary to include as the thread name introduces global
+	 * state with a small but theoretical chance of conflicting with another
+	 * thread in the user's code
+	 * 
+	 * @param replenisherThreadName
+	 */
+	public void setReplenisherThreadName(String replenisherThreadName) {
+		this.replenisherThreadName = replenisherThreadName;
+	}
+
+	/**
+	 * Threadsafe if 1) run from single thread, and 2) only code location from
+	 * which release is called
+	 */
+
+	private void replenishTokens() {
+		for (LocationData data : locationData.values()) {
+			int usedPermits = maxMessagesPerTimeWindow - data.semaphore.availablePermits();
+			data.semaphore.release(usedPermits);
+		}
+	}
+
+	/**
+	 * Logs a message for every location that has muzzled messages. It is good
+	 * design to log from this process as it happens on own threadpool offline
+	 * from any other logging that may happen in this application
+	 */
+	private void logMuzzledMessages() {
+
+		Iterator<Map.Entry<String, LocationData>> it = locationData.entrySet().iterator();
+
+		while (it.hasNext()) {
+
+			Map.Entry<String, LocationData> entry = it.next();
+
+			String location = entry.getKey();
+			LocationData data = entry.getValue();
+
+			int nrMuzzled = data.messagesMuzzled.getAndSet(0);
+
+			final String message = "Muzzled " + nrMuzzled + " message" + (nrMuzzled > 1 ? "s" : "") + " from "
+					+ location;
+
+			// Log how many messages have been muzzled for the current
+			// location
+			switch (logMuzzledMessagesOnLevel.levelInt) {
+				case Level.TRACE_INT:
+					Log.logger.trace(message);
+					break;
+				case Level.DEBUG_INT:
+					Log.logger.debug(message);
+					break;
+				case Level.INFO_INT:
+					Log.logger.info(message);
+					break;
+				case Level.WARN_INT:
+					Log.logger.warn(message);
+					break;
+				case Level.ERROR_INT:
+					Log.logger.error(message);
+					break;
+				default:
+					Log.logger.error("Unable to muzzle messages due to unexpected Level enum: ",
+							logMuzzledMessagesOnLevel);
+			}
+		}
+	}
+
+	/**
+	 * Used to instantiate a logger outside the Logback configuration process
+	 */
+	private static class Log {
+		final static Logger logger = LoggerFactory.getLogger(Log.class);
+	}
 }
